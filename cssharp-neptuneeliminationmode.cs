@@ -1,18 +1,17 @@
-﻿// Counter-Strike 2 plugin for elimination mode using CounterStrikeSharp
-
-using CounterStrikeSharp.API;
+﻿using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 
 namespace NeptuneEliminationMode
 {
     [MinimumApiVersion(80)]
     public class NeptuneEliminationMode : BasePlugin
     {
-        // Dictionary to track who has killed whom
-        private readonly Dictionary<int, List<int>> playerKillMap = new();
+        private readonly ConcurrentDictionary<int, HashSet<int>> playerKillMap = new();
+        private const int MAX_KILLS_PER_PLAYER = 100;
 
         public override string ModuleName => "Neptune Elimination Mode";
         public override string ModuleVersion => "1.0.0";
@@ -21,75 +20,226 @@ namespace NeptuneEliminationMode
 
         public override void Load(bool hotReload)
         {
-            Logger.LogInformation("Neptune Elimination Mode plugin is loading.");
+            try
+            {
+                Logger.LogInformation("Neptune Elimination Mode plugin is loading. HotReload: {HotReload}", hotReload);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error during plugin load");
+                throw;
+            }
         }
 
         public override void Unload(bool hotReload)
         {
-            Logger.LogInformation("Neptune Elimination Mode plugin is unloading.");
+            try
+            {
+                playerKillMap.Clear();
+                Logger.LogInformation("Neptune Elimination Mode plugin is unloading. HotReload: {HotReload}", hotReload);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error during plugin unload");
+            }
         }
 
-        [GameEventHandler]
+        [GameEventHandler(HookMode.Post)]
         public HookResult OnPlayerDeath(EventPlayerDeath @event, GameEventInfo info)
         {
-            var killer = @event.Attacker; // Adjust to correct property
-            var victim = @event.Userid;   // Use correct property for the victim
-
-            if (victim == null || victim.UserId == null)
+            try
             {
-                Logger.LogWarning("Victim is null or UserId is not set in OnPlayerDeath event.");
+                if (@event == null)
+                {
+                    Logger.LogWarning("Received null EventPlayerDeath");
+                    return HookResult.Continue;
+                }
+
+                var killer = @event.Attacker;
+                var victim = @event.Userid;
+
+                if (victim == null)
+                {
+                    Logger.LogWarning("Victim is null in OnPlayerDeath event");
+                    return HookResult.Continue;
+                }
+
+                if (!IsValidPlayer(victim))
+                {
+                    Logger.LogWarning("Invalid victim in OnPlayerDeath event");
+                    return HookResult.Continue;
+                }
+
+                if (IsTeamEliminated(victim))
+                {
+                    Logger.LogInformation("Team {Team} has been eliminated", victim.Team);
+                    return HookResult.Continue;
+                }
+
+                if (killer != null && IsValidPlayer(killer) && killer != victim)
+                {
+                    HandleKillTracking(killer.UserId!.Value, victim.UserId!.Value);
+                }
+
+                HandleVictimRespawns(victim.UserId!.Value);
+
                 return HookResult.Continue;
             }
-
-            // Check if the victim's team is eliminated
-            bool isTeamEliminated = true;
-            var allPlayers = Utilities.GetPlayers(); // Retrieve all players
-            foreach (var player in allPlayers)
+            catch (Exception ex)
             {
-                if (player.Team == victim.Team && player.PawnIsAlive)
-                {
-                    isTeamEliminated = false;
-                    break;
-                }
-            }
-
-            // If the team is eliminated, end the round normally
-            if (isTeamEliminated)
-            {
+                Logger.LogError(ex, "Error in OnPlayerDeath event handling");
                 return HookResult.Continue;
             }
-
-            // If there is a killer, track the kill
-            if (killer != null && killer.UserId.HasValue && killer.UserId != victim.UserId)
-            {
-                if (!playerKillMap.ContainsKey(killer.UserId.Value))
-                {
-                    playerKillMap[killer.UserId.Value] = new List<int>();
-                }
-                playerKillMap[killer.UserId.Value].Add(victim.UserId.Value);
-            }
-
-            // Check if the victim has killed anyone and respawn them
-            if (playerKillMap.ContainsKey(victim.UserId.Value))
-            {
-                foreach (var respawnPlayerId in playerKillMap[victim.UserId.Value])
-                {
-                    var respawnPlayer = Utilities.GetPlayerFromUserid(respawnPlayerId); // Retrieve player by ID
-                    respawnPlayer?.Respawn();
-                }
-                playerKillMap.Remove(victim.UserId.Value);
-            }
-
-            return HookResult.Continue;
         }
 
-        [GameEventHandler]
+        [GameEventHandler(HookMode.Pre)]
         public HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
         {
-            // Clear the kill map at the start of a new round
-            playerKillMap.Clear();
-            Logger.LogInformation("Round has started. Kill map cleared.");
-            return HookResult.Continue;
+            try
+            {
+                if (@event == null)
+                {
+                    Logger.LogWarning("Received null EventRoundStart");
+                    return HookResult.Continue;
+                }
+
+                playerKillMap.Clear();
+                CleanupStaleEntries();
+                Logger.LogInformation("Round has started. Kill map cleared and cleaned.");
+                return HookResult.Continue;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error in OnRoundStart event handling");
+                return HookResult.Continue;
+            }
+        }
+
+        [GameEventHandler(HookMode.Post)]
+        public HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
+        {
+            try
+            {
+                if (@event?.Userid == null || !@event.Userid.UserId.HasValue)
+                {
+                    Logger.LogWarning("Invalid or null player in OnPlayerDisconnect");
+                    return HookResult.Continue;
+                }
+
+                int userId = @event.Userid.UserId.Value;
+                if (playerKillMap.TryRemove(userId, out _))
+                {
+                    Logger.LogInformation("Removed disconnected player {UserId} from kill map", userId);
+                }
+                return HookResult.Continue;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error in OnPlayerDisconnect handling");
+                return HookResult.Continue;
+            }
+        }
+
+        private bool IsValidPlayer(CCSPlayerController? player)
+        {
+            return player != null &&
+                   player.IsValid &&
+                   player.UserId.HasValue &&
+                   !player.IsBot &&
+                   !player.IsHLTV;
+        }
+
+        private bool IsTeamEliminated(CCSPlayerController? victim)
+        {
+            try
+            {
+                if (victim == null || !victim.IsValid)
+                {
+                    Logger.LogWarning("Cannot check team elimination: victim is null or invalid");
+                    return false;
+                }
+
+                var allPlayers = Utilities.GetPlayers();
+                return !allPlayers.Any(p =>
+                    p.IsValid &&
+                    p.Team == victim.Team &&
+                    p.PawnIsAlive &&
+                    !p.IsBot &&
+                    !p.IsHLTV);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error checking team elimination status for victim {UserId}", victim?.UserId ?? -1);
+                return false;
+            }
+        }
+
+        private void HandleKillTracking(int killerId, int victimId)
+        {
+            playerKillMap.AddOrUpdate(
+                killerId,
+                new HashSet<int> { victimId },
+                (_, existingKills) =>
+                {
+                    if (existingKills.Count >= MAX_KILLS_PER_PLAYER)
+                    {
+                        Logger.LogWarning("Player {KillerId} reached kill tracking limit", killerId);
+                        return existingKills;
+                    }
+                    existingKills.Add(victimId);
+                    return existingKills;
+                });
+        }
+
+        private void HandleVictimRespawns(int victimId)
+        {
+            if (!playerKillMap.TryRemove(victimId, out var killedPlayers))
+                return;
+
+            foreach (var respawnPlayerId in killedPlayers)
+            {
+                try
+                {
+                    var player = Utilities.GetPlayerFromUserid(respawnPlayerId);
+                    if (player != null && IsValidPlayer(player) && !player.PawnIsAlive)
+                    {
+                        player.Respawn();
+                        Logger.LogInformation("Respawned player {PlayerId}", respawnPlayerId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError(ex, "Error respawning player {PlayerId}", respawnPlayerId);
+                }
+            }
+        }
+
+        private void CleanupStaleEntries()
+        {
+            try
+            {
+                var allPlayers = Utilities.GetPlayers();
+                var activeUserIds = allPlayers
+                    .Where(p => IsValidPlayer(p) && p.UserId.HasValue) // Ensure UserId has a value
+                    .Select(p => p.UserId!.Value) // Safe now with HasValue check
+                    .ToHashSet();
+
+                var staleKeys = playerKillMap.Keys
+                    .Where(k => !activeUserIds.Contains(k))
+                    .ToList();
+
+                foreach (var key in staleKeys)
+                {
+                    if (playerKillMap.TryRemove(key, out _))
+                    {
+                        Logger.LogInformation("Removed stale player {UserId} from kill map", key);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error during stale entry cleanup");
+            }
         }
     }
 }
